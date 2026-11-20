@@ -1,0 +1,495 @@
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import mongoose from 'mongoose';
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import { GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { MemoryVectorStore } from 'langchain/vectorstores/memory';
+import { MongoDBAtlasVectorSearch } from '@langchain/community/vectorstores/mongodb_atlas';
+import { Document as LangChainDocument } from '@langchain/core/documents';
+import { ChatPromptTemplate, MessagesPlaceholder } from '@langchain/core/prompts';
+import { HumanMessage, AIMessage } from '@langchain/core/messages';
+import DocumentModel from '../models/Document.js';
+import ChatMessageModel from '../models/ChatMessage.js';
+
+// In-Memory Fallback Storage (when MongoDB is offline/unreachable)
+const inMemoryDocuments = new Map();
+const inMemoryChatHistory = [];
+const inMemoryChunksMap = new Map(); // Stores text chunks per URL for fallback similarity matching
+
+let atlasVectorStore = null;
+let memoryVectorStore = null;
+let embeddingsEngine = null;
+
+const CHUNKS_COLLECTION = 'chunks';
+const VECTOR_INDEX_NAME = 'vector_index';
+
+// How many prior user/assistant exchanges to carry into a follow-up question.
+// Kept small deliberately: more history costs tokens and makes the rewrite step
+// drift toward older topics the user has already moved on from.
+const CHAT_HISTORY_TURNS = 3;
+
+const isDbConnected = () => mongoose.connection.readyState === 1;
+
+ //Initialize Embeddings
+
+const getEmbeddingsEngine = () => {
+  if (!embeddingsEngine) {
+    const apiKey = process.env.GOOGLE_API_KEY;
+    if (!apiKey) {
+      throw new Error('GOOGLE_API_KEY environment variable is not configured.');
+    }
+    embeddingsEngine = new GoogleGenerativeAIEmbeddings({
+      apiKey,
+      model: process.env.GOOGLE_EMBEDDING_MODEL || 'models/gemini-embedding-001'
+    });
+  }
+  return embeddingsEngine;
+};
+
+const getVectorStore = async () => {
+  const embeddings = getEmbeddingsEngine();
+
+  if (isDbConnected()) {
+    if (!atlasVectorStore) {
+      const collection = mongoose.connection.collection(CHUNKS_COLLECTION);
+      atlasVectorStore = new MongoDBAtlasVectorSearch(embeddings, {
+        collection,
+        indexName: VECTOR_INDEX_NAME,
+        textKey: 'text',
+        embeddingKey: 'embedding'
+      });
+    }
+    return atlasVectorStore;
+  }
+
+  if (!memoryVectorStore) {
+    memoryVectorStore = new MemoryVectorStore(embeddings);
+  }
+  return memoryVectorStore;
+};
+
+
+ //Remove previously indexed chunks for a URL from whichever vector store backend is active
+ 
+const removeUrlFromVectorStore = async (url) => {
+  if (isDbConnected()) {
+    await mongoose.connection.collection(CHUNKS_COLLECTION).deleteMany({ url });
+  } else if (memoryVectorStore && memoryVectorStore.memoryVectors) {
+    memoryVectorStore.memoryVectors = memoryVectorStore.memoryVectors.filter(
+      (v) => v.metadata && v.metadata.url !== url
+    );
+  }
+};
+
+/**
+ * Scrape webpage using Axios and Cheerio, stripping non-content tags
+ */
+export const scrapeAndCleanUrl = async (url) => {
+  try {
+    const response = await axios.get(url, {
+      timeout: 15000,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      }
+    });
+
+    const html = response.data;
+    const $ = cheerio.load(html);
+
+    // Extract Title (use only the document's own <title>, not stray <title> nodes
+    // inside inline SVG icons, and collapse any internal whitespace/newlines)
+    const title =
+      $('head > title').first().text().replace(/\s+/g, ' ').trim() ||
+      $('h1').first().text().replace(/\s+/g, ' ').trim() ||
+      $('meta[property="og:title"]').attr('content') ||
+      url;
+
+    // Strip script, style, nav, footer, header, aside, iframe, noscript, etc.
+    $('script, style, nav, footer, header, aside, iframe, noscript, svg, form').remove();
+
+    // Extract text from main or body
+    let rawText = '';
+    if ($('main').length > 0) {
+      rawText = $('main').text();
+    } else if ($('article').length > 0) {
+      rawText = $('article').text();
+    } else {
+      rawText = $('body').text();
+    }
+
+    // Clean whitespace
+    const cleanedText = rawText
+      .replace(/\s+/g, ' ')
+      .replace(/\n+/g, '\n')
+      .trim();
+
+    if (!cleanedText || cleanedText.length < 50) {
+      throw new Error('Could not extract sufficient readable text from the provided URL.');
+    }
+
+    return { title, text: cleanedText };
+  } catch (error) {
+    if (error.response) {
+      throw new Error(`Failed to scrape URL (HTTP ${error.response.status}): ${error.response.statusText}`);
+    } else if (error.code === 'ECONNABORTED') {
+      throw new Error('Webpage request timed out. Please verify the URL and try again.');
+    }
+    throw new Error(`Scraping error: ${error.message}`);
+  }
+};
+
+/**
+ * Ingest URL into vector store and database
+ */
+export const processAndIndexUrl = async (url) => {
+  // Step 1: Scrape
+  const { title, text } = await scrapeAndCleanUrl(url);
+
+  // Step 2: Chunk
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200
+  });
+
+  const rawDocs = await splitter.createDocuments([text], [{ url, title }]);
+  const chunkCount = rawDocs.length;
+
+  // Add chunk metadata index
+  const docs = rawDocs.map((doc, idx) => {
+    return new LangChainDocument({
+      pageContent: doc.pageContent,
+      metadata: {
+        url,
+        title,
+        chunkIndex: idx,
+        totalChunks: chunkCount
+      }
+    });
+  });
+
+  // Store chunks in fallback memory map
+  inMemoryChunksMap.set(url, docs);
+
+  // Step 3 & 4: Embed & Index into Vector Store
+  try {
+    const store = await getVectorStore();
+    await removeUrlFromVectorStore(url); // avoid duplicate chunks if this URL was already indexed
+    await store.addDocuments(docs);
+  } catch (embedError) {
+    console.warn(`[VectorStore Indexing Notice]: Embedding API warning (${embedError.message}). Fallback chunk index active.`);
+  }
+
+  // Save to DB or In-Memory fallback
+  let docData;
+  if (isDbConnected()) {
+    const savedDoc = await DocumentModel.findOneAndUpdate(
+      { url },
+      { title, chunkCount, createdAt: new Date() },
+      { upsert: true, new: true }
+    );
+    docData = {
+      documentId: savedDoc._id,
+      url: savedDoc.url,
+      title: savedDoc.title,
+      chunkCount: savedDoc.chunkCount,
+      createdAt: savedDoc.createdAt
+    };
+  } else {
+    const memId = `mem_${Date.now()}`;
+    docData = {
+      documentId: memId,
+      _id: memId,
+      url,
+      title,
+      chunkCount,
+      createdAt: new Date()
+    };
+    inMemoryDocuments.set(url, docData);
+  }
+
+  return docData;
+};
+
+/**
+ * Keyword & Text Relevance Fallback Search
+ */
+const performTextRelevanceSearch = (url, question, k = 4) => {
+  const docs = inMemoryChunksMap.get(url) || [];
+  if (docs.length === 0) return [];
+
+  const queryTerms = question.toLowerCase().split(/\W+/).filter(t => t.length > 2);
+
+  const scoredDocs = docs.map(doc => {
+    const textLower = doc.pageContent.toLowerCase();
+    let score = 0;
+    queryTerms.forEach(term => {
+      if (textLower.includes(term)) {
+        score += 1;
+      }
+    });
+    return { doc, score };
+  });
+
+  scoredDocs.sort((a, b) => b.score - a.score);
+  
+  // Return top K docs (or first K docs if all scores 0)
+  return scoredDocs.slice(0, k).map(item => item.doc);
+};
+
+/**
+ * Build a Gemini chat model. Temperature is caller-controlled because the two
+ * uses want different behaviour: answering wants a little natural phrasing,
+ * question-rewriting wants a deterministic mechanical transformation.
+ */
+const getChatModel = (temperature) =>
+  new ChatGoogleGenerativeAI({
+    apiKey: process.env.GOOGLE_API_KEY,
+    model: process.env.GOOGLE_CHAT_MODEL || 'models/gemini-3.6-flash',
+    temperature
+  });
+
+/**
+ * Fetch the last few exchanges for a URL, oldest first.
+ */
+const getRecentHistory = async (url) => {
+  const all = await getStoredChatHistory(url);
+  return all
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .slice(-CHAT_HISTORY_TURNS * 2); // each turn is a user message + an assistant reply
+};
+
+/**
+ * Turn a follow-up question into a standalone one using the conversation so far.
+ *
+ * This exists because retrieval embeds the *question*. A bare "who wrote it?"
+ * carries almost no meaning on its own, so its vector lands nowhere near the
+ * relevant chunks and the search returns noise no matter how good the index is.
+ * Rewriting it to "who wrote Game of Thrones?" is what makes follow-ups
+ * retrievable at all.
+ *
+ * Falls back to the original question on any failure — a broken rewrite should
+ * degrade the answer, never break the chat.
+ */
+const rewriteQuestionWithHistory = async (question, history) => {
+  if (history.length === 0) return question; // first question of a conversation
+
+  try {
+    const transcript = history
+      .map((m) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.content).slice(0, 800)}`)
+      .join('\n');
+
+    const rewritePrompt = ChatPromptTemplate.fromMessages([
+      [
+        'system',
+        `You rewrite a follow-up question into a standalone question.
+
+Rules:
+1. Use the conversation history ONLY to resolve references — pronouns like "it", "he", "they", "that", or an implied subject.
+2. If the question already stands on its own, return it completely unchanged.
+3. Never answer the question. Never add facts that are not in the history.
+4. Reply with ONLY the rewritten question — no preamble, quotes, or explanation.
+
+Conversation history:
+{transcript}`
+      ],
+      ['human', 'Follow-up question: {question}']
+    ]);
+
+    const formatted = await rewritePrompt.formatMessages({ transcript, question });
+    const response = await getChatModel(0).invoke(formatted);
+    const rewritten = (typeof response.content === 'string' ? response.content : '').trim();
+
+    // Guard against the model ignoring instructions and rambling or returning
+    // nothing — in either case the original question is the safer input.
+    if (!rewritten || rewritten.length > question.length * 3 + 120) {
+      return question;
+    }
+
+    if (rewritten !== question) {
+      console.log(`[Query Rewrite] "${question}" -> "${rewritten}"`);
+    }
+    return rewritten;
+  } catch (err) {
+    console.warn(`[Query Rewrite Warning]: ${err.message}. Using the original question.`);
+    return question;
+  }
+};
+
+/**
+ * Answer chat question using RAG similarity search and Gemini-1.5-Flash
+ */
+export const queryRagChain = async (url, question) => {
+  let filteredDocs = [];
+
+  // Read history BEFORE this turn is saved, so the current question isn't in
+  // its own history.
+  const history = await getRecentHistory(url);
+
+  // Retrieval runs on the rewritten question; the user's original wording is
+  // what gets shown and stored.
+  const searchQuery = await rewriteQuestionWithHistory(question, history);
+
+  // Try Vector Store similarity search
+  try {
+    const store = await getVectorStore();
+    const searchResults = await store.similaritySearch(searchQuery, 15);
+    filteredDocs = searchResults.filter((doc) => doc.metadata && doc.metadata.url === url).slice(0, 4);
+  } catch (err) {
+    console.warn(`[Vector Search Warning]: ${err.message}. Using fallback relevance index.`);
+  }
+
+  // Fallback to text relevance search if vector search returned no results
+  if (!filteredDocs || filteredDocs.length === 0) {
+    filteredDocs = performTextRelevanceSearch(url, searchQuery, 4);
+  }
+
+  // Format context string
+  const contextText = filteredDocs
+    .map((doc, index) => `[Source Chunk ${index + 1}]\n${doc.pageContent}`)
+    .join('\n\n');
+
+  if (!contextText || filteredDocs.length === 0) {
+    const fallbackAnswer = "I could not find relevant information in the provided URL. Please make sure the URL has been properly indexed.";
+    
+    // Save to Chat History
+    if (isDbConnected()) {
+      await ChatMessageModel.create({ url, role: 'user', content: question });
+      await ChatMessageModel.create({ url, role: 'assistant', content: fallbackAnswer, sources: [] });
+    } else {
+      inMemoryChatHistory.push(
+        { url, role: 'user', content: question, createdAt: new Date() },
+        { url, role: 'assistant', content: fallbackAnswer, sources: [], createdAt: new Date() }
+      );
+    }
+
+    return {
+      answer: fallbackAnswer,
+      sources: []
+    };
+  }
+
+  // Prepare Gemini Model
+  const model = getChatModel(0.2);
+
+  const promptTemplate = ChatPromptTemplate.fromMessages([
+    [
+      'system',
+      `You are an AI assistant helping users answer questions based strictly on the provided website content context.
+
+Rules:
+1. Answer questions strictly based on the provided context below.
+2. If the context lacks sufficient info, state strictly: "I could not find relevant information in the provided URL."
+3. Do not assume or extrapolate facts not present in the context.
+4. Format your answer with clear markdown (bold headers, bullet points, tables, code blocks) when appropriate.
+5. Earlier messages in this conversation are provided only so you can tell what the
+   user is referring to. They are NOT a source of facts — every factual claim in your
+   answer must come from the Context below, even if you stated something different earlier.
+
+Context:
+{context}`
+    ],
+    new MessagesPlaceholder('history'),
+    ['human', '{question}']
+  ]);
+
+  // Replay prior turns as real chat messages so the model can resolve references
+  // like "it" or "he" on its own.
+  const historyMessages = history.map((m) =>
+    m.role === 'assistant' ? new AIMessage(String(m.content)) : new HumanMessage(String(m.content))
+  );
+
+  const formattedPrompt = await promptTemplate.formatMessages({
+    context: contextText,
+    history: historyMessages,
+    question
+  });
+
+  const response = await model.invoke(formattedPrompt);
+  const answer = typeof response.content === 'string' ? response.content : JSON.stringify(response.content);
+
+  // Extract source excerpts for response
+  const sources = filteredDocs.map((doc) => ({
+    pageContent: doc.pageContent,
+    metadata: doc.metadata
+  }));
+
+  // Save to Chat History
+  if (isDbConnected()) {
+    await ChatMessageModel.create({ url, role: 'user', content: question });
+    await ChatMessageModel.create({ url, role: 'assistant', content: answer, sources });
+  } else {
+    inMemoryChatHistory.push(
+      { url, role: 'user', content: question, createdAt: new Date() },
+      { url, role: 'assistant', content: answer, sources, createdAt: new Date() }
+    );
+  }
+
+  return {
+    answer,
+    sources
+  };
+};
+
+/**
+ * Remove document and vectors
+ */
+export const removeDocumentFromStore = async (url) => {
+  await removeUrlFromVectorStore(url);
+  inMemoryChunksMap.delete(url);
+
+  if (isDbConnected()) {
+    const docResult = await DocumentModel.findOneAndDelete({ url });
+    await ChatMessageModel.deleteMany({ url });
+    return docResult;
+  } else {
+    inMemoryDocuments.delete(url);
+    const indicesToRemove = [];
+    inMemoryChatHistory.forEach((msg, i) => {
+      if (msg.url === url) indicesToRemove.push(i);
+    });
+    for (let i = indicesToRemove.length - 1; i >= 0; i--) {
+      inMemoryChatHistory.splice(indicesToRemove[i], 1);
+    }
+    return { url };
+  }
+};
+
+/**
+ * Get all document records
+ */
+export const getStoredDocuments = async () => {
+  if (isDbConnected()) {
+    return await DocumentModel.find().sort({ createdAt: -1 });
+  }
+  return Array.from(inMemoryDocuments.values()).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+};
+
+/**
+ *Get chat history for URL
+ */
+export const getStoredChatHistory = async (url) => {
+  if (isDbConnected()) {
+    return await ChatMessageModel.find({ url }).sort({ createdAt: 1 });
+  }
+  return inMemoryChatHistory.filter((msg) => msg.url === url);
+};
+
+/**
+ * Verify persisted vector data at server boot.
+ * Embeddings now live in MongoDB Atlas Vector Search (the "chunks" collection), so they
+ * survive restarts and do not need to be re-scraped/re-embedded on every boot.
+ */
+export const rehydrateVectorStoreFromDb = async () => {
+  if (!isDbConnected()) return;
+  try {
+    const docCount = await DocumentModel.countDocuments();
+    const chunkCount = await mongoose.connection.collection(CHUNKS_COLLECTION).countDocuments();
+    console.log(
+      `[RAG Service] Found ${docCount} document record(s) and ${chunkCount} indexed chunk(s) already persisted in MongoDB Atlas Vector Search.`
+    );
+  } catch (error) {
+    console.error(`[RAG Service] Rehydration check error: ${error.message}`);
+  }
+};
