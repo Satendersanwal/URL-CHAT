@@ -37,7 +37,7 @@ The result is a focused reading companion for articles, documentation, project p
 
 ![URL-CHAT desktop interface with a source library, AI-generated answer, and source controls](docs/images/app-preview.png)
 
-*Actual screenshot of the [upstream demo](https://url-chat-ten.vercel.app/), showing a conversation about a public GitHub profile. The demo is an existing upstream deployment, not a deployment created by this repository.*
+*URL-CHAT interface showing a conversation about Satender Sanwal's public GitHub profile.*
 
 ### A simple workflow
 
@@ -401,7 +401,7 @@ Keep `VITE_API_URL` unset so frontend requests use `/api` on the same origin. Ke
 | Start | Host serves static assets | `npm run start:prod` |
 | Environment | `VITE_API_URL=https://YOUR-BACKEND/api` | Google key, optional MongoDB URI, model overrides, `CLIENT_URL=https://YOUR-FRONTEND` |
 
-Frontend environment variables are embedded at build time. Rebuild after changing `VITE_API_URL`. Use your own deployment URLs; the upstream demo linked above is separate.
+Frontend environment variables are embedded at build time. Rebuild after changing `VITE_API_URL`. Use your own frontend and backend deployment URLs.
 
 ## Troubleshooting
 
@@ -440,12 +440,6 @@ These are future ideas, not shipped features:
 - [ ] Durable fallback retrieval after restarts.
 - [ ] PDF ingestion and optional JavaScript-rendered page extraction.
 - [ ] Automated API and retrieval regression tests.
-
-## Credits
-
-This repository was imported from [rishavk808/URL-CHAT](https://github.com/rishavk808/URL-CHAT). Credit to the upstream author for the original application.
-
-The README includes a custom generated banner and a screenshot of the existing upstream demo. No performance benchmarks or test-coverage claims are implied by the badges.
 
 ---
 

@@ -2,7 +2,7 @@ import axios from 'axios';
 
 // In development this stays '/api' and Vite's proxy forwards it to the local server.
 // In production (frontend on Vercel, backend on Render) set VITE_API_URL to the
-// backend's URL, e.g. https://url-chat-api.onrender.com/api
+// backend's URL, e.g. https://your-backend.example.com/api
 const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
 const api = axios.create({
