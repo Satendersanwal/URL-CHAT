@@ -16,6 +16,13 @@
 </p>
 
 <p align="center">
+  <a href="https://url-chat-ten.vercel.app/">
+    <img alt="Try the Live Demo" src="https://img.shields.io/badge/Try_the_Live_Demo-Open_App-635BFF?style=for-the-badge&amp;logo=vercel&amp;logoColor=white" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://url-chat-ten.vercel.app/">Live Demo</a> ·
   <a href="#preview">Preview</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#architecture">Architecture</a> ·
